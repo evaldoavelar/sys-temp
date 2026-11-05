@@ -44,6 +44,9 @@ Comandos: [q] Sair  [Espaço] Pausar  [1] 1s  [2] 2s  [c] Layout  | 12:12:08
 
 ---
 
+<img width="540" height="1168" alt="image" src="https://github.com/user-attachments/assets/3cffab27-bc35-4bb5-a26d-d2a5c1b77c93" />
+
+
 ## ✨ Recursos
 
 - **🌡️ Termômetro Mestre (Master Gauge)**:
