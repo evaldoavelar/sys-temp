@@ -12,6 +12,8 @@ import time
 import argparse
 import select
 import subprocess
+import termios
+import tty
 from collections import deque
 from datetime import datetime
 
@@ -339,7 +341,8 @@ class HardwareMonitor:
             'gpu_temp': gpu_temp,
         }
 
-    def render(self, data: dict, console: Console, force_compact: bool = False, show_charts: bool = True) -> Group:
+    def render(self, data: dict, console: Console, force_compact: bool = False, show_charts: bool = True,
+               paused: bool = False, interval: float = 1.5, layout_mode: int = 0) -> Group:
         term_w = console.width
         term_h = console.height
 
@@ -572,19 +575,31 @@ class HardwareMonitor:
         elements.append(gauges_row)
         elements.append(Text(""))      # Margem antes do rodapé
 
-        # Rodapé
+        # Rodapé com status interativo
         footer_text = Text()
-        footer_text.append("Comandos: ", style="dim")
-        footer_text.append("[q]", style="bold cyan")
-        footer_text.append(" Sair  ", style="dim")
-        footer_text.append("[Espaço]", style="bold cyan")
-        footer_text.append(" Pausar  ", style="dim")
-        footer_text.append("[1]", style="bold cyan")
+        if paused:
+            footer_text.append(" [PAUSADO] ", style="bold bright_white on red")
+            footer_text.append(" ")
+            footer_text.append("[Espaço]", style="bold bright_yellow")
+            footer_text.append(" Retomar  ", style="bold yellow")
+        else:
+            footer_text.append("Comandos: ", style="dim")
+            footer_text.append("[q]", style="bold cyan")
+            footer_text.append(" Sair  ", style="dim")
+            footer_text.append("[Espaço]", style="bold cyan")
+            footer_text.append(" Pausar  ", style="dim")
+
+        s1_style = "bold white on dark_cyan" if abs(interval - 1.0) < 0.1 else "bold cyan"
+        s2_style = "bold white on dark_cyan" if abs(interval - 2.0) < 0.1 else "bold cyan"
+        footer_text.append("[1]", style=s1_style)
         footer_text.append(" 1s  ", style="dim")
-        footer_text.append("[2]", style="bold cyan")
+        footer_text.append("[2]", style=s2_style)
         footer_text.append(" 2s  ", style="dim")
+
+        mode_names = ["Completo", "Focado", "Compacto"]
+        cur_mode = mode_names[layout_mode % len(mode_names)]
         footer_text.append("[c]", style="bold cyan")
-        footer_text.append(" Layout  ", style="dim")
+        footer_text.append(f" {cur_mode}  ", style="dim")
         footer_text.append(f"| {datetime.now().strftime('%H:%M:%S')}", style="dim")
 
         elements.append(footer_text)
@@ -623,38 +638,119 @@ def main():
 
     interval = args.interval
     paused = False
-    force_compact = args.compact
+    layout_mode = 2 if args.compact else 0
+    force_compact = (layout_mode == 2)
+    show_charts = (layout_mode == 0)
+
+    # Configuração de terminal cbreak para resposta instantânea de teclas (sem esperar Enter)
+    fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+    old_settings = None
+    if fd is not None:
+        try:
+            old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            fd = None
 
     try:
         with Live(console=console, screen=True, auto_refresh=False) as live:
+            data = monitor.fetch_sensors()
+            renderable = monitor.render(
+                data, console=console,
+                force_compact=force_compact,
+                show_charts=show_charts,
+                paused=paused,
+                interval=interval,
+                layout_mode=layout_mode
+            )
+            live.update(renderable, refresh=True)
+
             while True:
                 if not paused:
                     data = monitor.fetch_sensors()
-                    renderable = monitor.render(data, console=console, force_compact=force_compact)
+                    renderable = monitor.render(
+                        data, console=console,
+                        force_compact=force_compact,
+                        show_charts=show_charts,
+                        paused=paused,
+                        interval=interval,
+                        layout_mode=layout_mode
+                    )
                     live.update(renderable, refresh=True)
 
-                if sys.stdin.isatty():
-                    rlist, _, _ = select.select([sys.stdin], [], [], interval)
+                if fd is not None:
+                    # Quando pausado, verifica a cada 0.15s para resposta instantânea ao despausar
+                    wait_time = 0.15 if paused else interval
+                    rlist, _, _ = select.select([sys.stdin], [], [], wait_time)
                     if rlist:
-                        key = sys.stdin.read(1).lower()
-                        if key in ['q', '\x03', '\x1b']:
+                        key = sys.stdin.read(1)
+                        if key.lower() == 'q' or key == '\x03':
+                            break
+                        elif key == '\x1b':
+                            # Trata ESC vs sequências de escape (ex: setas)
+                            r_more, _, _ = select.select([sys.stdin], [], [], 0.05)
+                            if r_more:
+                                sys.stdin.read(2)
+                                continue
                             break
                         elif key == ' ':
                             paused = not paused
+                            renderable = monitor.render(
+                                data, console=console,
+                                force_compact=force_compact,
+                                show_charts=show_charts,
+                                paused=paused,
+                                interval=interval,
+                                layout_mode=layout_mode
+                            )
+                            live.update(renderable, refresh=True)
                         elif key == '1':
                             interval = 1.0
+                            renderable = monitor.render(
+                                data, console=console,
+                                force_compact=force_compact,
+                                show_charts=show_charts,
+                                paused=paused,
+                                interval=interval,
+                                layout_mode=layout_mode
+                            )
+                            live.update(renderable, refresh=True)
                         elif key == '2':
                             interval = 2.0
-                        elif key == 'c':
-                            force_compact = not force_compact
-                            data = monitor.fetch_sensors()
-                            renderable = monitor.render(data, console=console, force_compact=force_compact)
+                            renderable = monitor.render(
+                                data, console=console,
+                                force_compact=force_compact,
+                                show_charts=show_charts,
+                                paused=paused,
+                                interval=interval,
+                                layout_mode=layout_mode
+                            )
+                            live.update(renderable, refresh=True)
+                        elif key.lower() == 'c':
+                            layout_mode = (layout_mode + 1) % 3
+                            force_compact = (layout_mode == 2)
+                            show_charts = (layout_mode == 0)
+
+                            renderable = monitor.render(
+                                data, console=console,
+                                force_compact=force_compact,
+                                show_charts=show_charts,
+                                paused=paused,
+                                interval=interval,
+                                layout_mode=layout_mode
+                            )
                             live.update(renderable, refresh=True)
                 else:
                     time.sleep(interval)
 
     except KeyboardInterrupt:
         pass
+    finally:
+        if fd is not None and old_settings is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
