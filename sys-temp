@@ -341,8 +341,170 @@ class HardwareMonitor:
             'gpu_temp': gpu_temp,
         }
 
+    def _build_footer(self, paused: bool, interval: float, layout_mode: int) -> Text:
+        footer_text = Text()
+        if paused:
+            footer_text.append(" [PAUSADO] ", style="bold bright_white on red")
+            footer_text.append(" ")
+            footer_text.append("[Espaço]", style="bold bright_yellow")
+            footer_text.append(" Retomar  ", style="bold yellow")
+        else:
+            footer_text.append("Comandos: ", style="dim")
+            footer_text.append("[q]", style="bold cyan")
+            footer_text.append(" Sair  ", style="dim")
+            footer_text.append("[Espaço]", style="bold cyan")
+            footer_text.append(" Pausar  ", style="dim")
+
+        s1_style = "bold white on dark_cyan" if abs(interval - 1.0) < 0.1 else "bold cyan"
+        s2_style = "bold white on dark_cyan" if abs(interval - 2.0) < 0.1 else "bold cyan"
+        footer_text.append("[1]", style=s1_style)
+        footer_text.append(" 1s  ", style="dim")
+        footer_text.append("[2]", style=s2_style)
+        footer_text.append(" 2s  ", style="dim")
+
+        mode_names = ["Completo", "Focado", "Compacto"]
+        cur_mode = mode_names[layout_mode % len(mode_names)]
+        footer_text.append("[c]", style="bold cyan")
+        footer_text.append(f" {cur_mode}  ", style="dim")
+        footer_text.append(f"| {datetime.now().strftime('%H:%M:%S')}", style="dim")
+        return footer_text
+
+    def _render_compact(self, data: dict, console: Console, paused: bool = False, interval: float = 1.5, layout_mode: int = 2) -> Group:
+        term_w = console.width
+        pkg_temp = data['pkg_temp']
+        fan_rpm = data['fan_rpm']
+        nvidia = data['nvidia']
+        intel = data['intel']
+        vmem = data['vmem']
+        swap = data['swap']
+        temps = data['temps']
+        disk = data.get('disk')
+
+        # 1. Termômetro Compacto em Linha Única
+        prop = max(0.0, min(1.0, (pkg_temp - 0.0) / 100.0))
+        seg_idx = min(len(CORES) - 1, int(round(prop * (len(CORES) - 1))))
+        cur_color = f"rgb({CORES[seg_idx][0]},{CORES[seg_idx][1]},{CORES[seg_idx][2]})"
+        frio_color = f"rgb({CORES[0][0]},{CORES[0][1]},{CORES[0][2]})"
+        quente_color = f"rgb({CORES[11][0]},{CORES[11][1]},{CORES[11][2]})"
+
+        compact_therm = Text()
+        compact_therm.append("FRIO ", style=f"bold {frio_color}")
+        for r, g, b in CORES:
+            compact_therm.append("██", style=f"rgb({r},{g},{b})")
+        compact_therm.append(" QUENTE", style=f"bold {quente_color}")
+        compact_therm.append(f"  ▲ {pkg_temp:.1f}°C", style=f"bold {cur_color}")
+
+        # 2. Cabeçalho de sistema
+        uptime_sec = time.time() - psutil.boot_time()
+        hours, rem = divmod(int(uptime_sec), 3600)
+        minutes, _ = divmod(rem, 60)
+        days, hours = divmod(hours, 24)
+        uptime_str = f"{days}d {hours}h {minutes}m" if days > 0 else f"{hours}h {minutes}m"
+        load1, load5, load15 = os.getloadavg()
+
+        header_table = Table(box=None, expand=True, padding=(0, 1), show_header=False)
+        header_table.add_column("Host", justify="left")
+        header_table.add_column("Uptime", justify="center")
+        header_table.add_column("Carga", justify="right")
+        header_table.add_row(
+            "[bold white]Dell Inspiron[/] [dim]| Core i7-8550U[/]",
+            f"[dim]Up:[/] [cyan]{uptime_str}[/]",
+            f"[dim]Load:[/] [bold cyan]{load1:.2f}[/] [dim]{load5:.2f} {load15:.2f}[/]"
+        )
+
+        # 3. Medidores inline compactos (1 linha por recurso)
+        bar_w = max(10, min(24, term_w - 36))
+        fan_pct = min(100.0, (fan_rpm / 5800.0) * 100.0 if fan_rpm > 0 else 0.0)
+        ram_used_gb = vmem.used / (1024**3)
+        ram_total_gb = vmem.total / (1024**3)
+        swap_used_mb = swap.used / (1024**2)
+        swap_total_mb = swap.total / (1024**2)
+
+        c_lines = [
+            f"[bold cyan]Fan [/]  {make_htop_pipe_bar(fan_pct, bar_w)}  [white]{fan_rpm:>4} RPM[/] [dim]({fan_pct:.0f}%)[/]",
+            f"[bold magenta]RAM [/]  {make_htop_pipe_bar(vmem.percent, bar_w)}  [white]{ram_used_gb:.1f}/{ram_total_gb:.1f}G[/] [dim]({vmem.percent:.0f}%)[/]",
+            f"[bold yellow]Swap[/]  {make_htop_pipe_bar(swap.percent, bar_w)}  [white]{swap_used_mb:.0f}/{swap_total_mb:.0f}M[/] [dim]({swap.percent:.0f}%)[/]",
+        ]
+
+        if disk:
+            disk_used_gb = disk.used / (1024**3)
+            disk_total_gb = disk.total / (1024**3)
+            c_lines.append(
+                f"[bold #05d9e8]SSD [/]  {make_htop_pipe_bar(disk.percent, bar_w)}  [white]{disk_used_gb:.0f}/{disk_total_gb:.0f}G[/] [dim]({disk.percent:.0f}%)[/]"
+            )
+        elif nvidia:
+            vram_used = nvidia['mem_used']
+            vram_total = nvidia['mem_total']
+            vram_pct = (vram_used / vram_total) * 100.0 if vram_total > 0 else 0.0
+            c_lines.append(
+                f"[bold green]VRAM[/]  {make_htop_pipe_bar(vram_pct, bar_w)}  [white]{vram_used:.0f}/{vram_total:.0f}M[/] [dim]({vram_pct:.0f}%)[/]"
+            )
+
+        c_lines.append(f"[dim]{'─' * max(20, term_w - 6)}[/]")
+
+        nvme = temps.get('NVMe', 0)
+        pch = temps.get('PCH', 0)
+        sodimm = temps.get('dell_SODIMM', 0)
+        dell_amb = temps.get('dell_Ambient', 0)
+        c_lines.append(
+            f"[dim]Sensores:[/] [white]NVMe {nvme:.0f}°[/] • [white]PCH {pch:.0f}°[/] • [white]RAM {sodimm:.0f}°[/] • [white]Amb {dell_amb:.0f}°[/]"
+        )
+
+        core_labels = ['Core 0', 'Core 1', 'Core 2', 'Core 3']
+        freqs = data['cpu_freqs']
+        cores_parts = []
+        for i, lbl in enumerate(core_labels):
+            t_core = temps.get(lbl, 0)
+            col = "green" if t_core < 65 else ("yellow" if t_core < 80 else "#ff2a6d")
+            cores_parts.append(f"[{col}]C{i}:{t_core:.0f}°[/]")
+        avg_freq = sum(f.current for f in freqs) / (len(freqs) * 1000.0) if freqs else 0.0
+        cores_str = " ".join(cores_parts)
+        if avg_freq > 0:
+            cores_str += f" [dim]({avg_freq:.1f}G)[/]"
+        c_lines.append(f"[dim]Núcleos:[/]  {cores_str}")
+
+        cur_freq = intel.get('gt_cur_freq_mhz', 300)
+        gpu_str = f"[white]UHD: {cur_freq}MHz[/]"
+        if nvidia and nvidia.get('temp', 0) > 0:
+            gpu_str += f" • [white]MX150: {nvidia['temp']:.0f}°[/]"
+        c_lines.append(f"[dim]Gráficos:[/] {gpu_str}")
+
+        top_parts = []
+        for p in data['top_procs'][:3]:
+            name = p.get('name', '')[:10]
+            cpu_p = p.get('cpu_percent', 0.0) or 0.0
+            col = "#ff2a6d" if cpu_p > 70 else ("yellow" if cpu_p > 25 else "cyan")
+            top_parts.append(f"[bold white]{name}[/] [{col}]{cpu_p:.1f}%[/]")
+        top_str = " • ".join(top_parts) if top_parts else "[dim]nenhum ativo[/]"
+        c_lines.append(f"[dim]Top CPU:[/]  {top_str}")
+
+        compact_panel = Panel(
+            Text.from_markup("\n".join(c_lines)),
+            title="[bold cyan] Hardware & Sensores (Compacto) [/]",
+            title_align="left",
+            box=box.ROUNDED,
+            padding=(0, 1)
+        )
+
+        footer_text = self._build_footer(paused, interval, layout_mode)
+
+        return Group(
+            Text(""),
+            Align.center(compact_therm),
+            Text(""),
+            header_table,
+            Text(""),
+            compact_panel,
+            Text(""),
+            footer_text
+        )
+
     def render(self, data: dict, console: Console, force_compact: bool = False, show_charts: bool = True,
                paused: bool = False, interval: float = 1.5, layout_mode: int = 0) -> Group:
+        # Se for modo Compacto (layout_mode == 2), renderiza a visão ultra-compacta dedicada
+        if layout_mode == 2 or force_compact:
+            return self._render_compact(data, console, paused=paused, interval=interval, layout_mode=2)
+
         term_w = console.width
         term_h = console.height
 
@@ -576,32 +738,7 @@ class HardwareMonitor:
         elements.append(Text(""))      # Margem antes do rodapé
 
         # Rodapé com status interativo
-        footer_text = Text()
-        if paused:
-            footer_text.append(" [PAUSADO] ", style="bold bright_white on red")
-            footer_text.append(" ")
-            footer_text.append("[Espaço]", style="bold bright_yellow")
-            footer_text.append(" Retomar  ", style="bold yellow")
-        else:
-            footer_text.append("Comandos: ", style="dim")
-            footer_text.append("[q]", style="bold cyan")
-            footer_text.append(" Sair  ", style="dim")
-            footer_text.append("[Espaço]", style="bold cyan")
-            footer_text.append(" Pausar  ", style="dim")
-
-        s1_style = "bold white on dark_cyan" if abs(interval - 1.0) < 0.1 else "bold cyan"
-        s2_style = "bold white on dark_cyan" if abs(interval - 2.0) < 0.1 else "bold cyan"
-        footer_text.append("[1]", style=s1_style)
-        footer_text.append(" 1s  ", style="dim")
-        footer_text.append("[2]", style=s2_style)
-        footer_text.append(" 2s  ", style="dim")
-
-        mode_names = ["Completo", "Focado", "Compacto"]
-        cur_mode = mode_names[layout_mode % len(mode_names)]
-        footer_text.append("[c]", style="bold cyan")
-        footer_text.append(f" {cur_mode}  ", style="dim")
-        footer_text.append(f"| {datetime.now().strftime('%H:%M:%S')}", style="dim")
-
+        footer_text = self._build_footer(paused, interval, layout_mode)
         elements.append(footer_text)
 
         return Group(*elements)
