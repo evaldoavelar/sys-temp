@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sys-temp / tempmon: Monitor visual de temperaturas, CPU, GPU, Fans, Memória e Swap.
+Com termômetro horizontal mestre no topo e layout espaçado estilo Sampler.
+Ambiente: Dell Inspiron (Intel Core i7-8550U, UHD 620, GeForce MX150, Ubuntu 24.04).
+"""
+
+import sys
+import os
+import time
+import argparse
+import select
+import subprocess
+from collections import deque
+from datetime import datetime
+
+try:
+    import psutil
+    import asciichartpy
+    from rich.console import Console, Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.live import Live
+    from rich.text import Text
+    from rich.align import Align
+    from rich import box
+except ImportError as err:
+    print(f"Erro: Dependência ausente ({err}). Instale com: pip install rich psutil asciichartpy")
+    sys.exit(1)
+
+# Paleta oficial de 12 cores do termômetro
+CORES = [
+    (30, 70, 230),    # 0 Azul
+    (20, 140, 255),   # 1 Azul vivo
+    (0, 190, 240),    # 2 Ciano
+    (0, 210, 160),    # 3 Ciano-verde
+    (40, 205, 90),    # 4 Verde
+    (130, 215, 40),   # 5 Verde-limão
+    (215, 220, 30),   # 6 Amarelo-esverdeado
+    (255, 205, 20),   # 7 Amarelo
+    (255, 145, 20),   # 8 Laranja claro
+    (250, 90, 30),    # 9 Laranja
+    (240, 50, 50),    # 10 Vermelho claro
+    (200, 25, 45),    # 11 Vermelho escuro
+]
+
+BLOCKS = "  ▂▃▄▅▆▇█"
+HISTORY_LEN = 60
+
+# --- 1. TERMÔMETRO HORIZONTAL MESTRE (SAÚDE GERAL DO PC) ---
+
+def build_master_thermometer(temp: float, min_t: float = 0.0, max_t: float = 100.0, seg_w: int = 4) -> Text:
+    """
+    Constrói o gráfico de termômetro horizontal em 12 blocos coloridos com ponteiro ▲
+    e escala FRIO (esquerda) -> QUENTE (direita, onde antes ficava a temperatura),
+    com valor em graus exibido sob o ponteiro.
+    """
+    num_segs = len(CORES)
+    total_bar_w = num_segs * (seg_w + 1) - 1
+    prop = max(0.0, min(1.0, (temp - min_t) / (max_t - min_t)))
+    seg_idx = min(num_segs - 1, int(round(prop * (num_segs - 1))))
+
+    t = Text()
+
+    # Linha 1: FRIO na esquerda ... QUENTE na extrema direita (alinhado com o fim do 12º bloco)
+    frio_color = f"rgb({CORES[0][0]},{CORES[0][1]},{CORES[0][2]})"
+    quente_color = f"rgb({CORES[11][0]},{CORES[11][1]},{CORES[11][2]})"
+    cur_color = f"rgb({CORES[seg_idx][0]},{CORES[seg_idx][1]},{CORES[seg_idx][2]})"
+
+    space_top = max(4, total_bar_w - len("FRIO") - len("QUENTE"))
+    t.append("FRIO", style=f"bold {frio_color}")
+    t.append(" " * space_top)
+    t.append("QUENTE\n", style=f"bold {quente_color}")
+
+    # Linha 2: Barra dos 12 blocos coloridos
+    for i, (r, g, b) in enumerate(CORES):
+        t.append("█" * seg_w, style=f"rgb({r},{g},{b})")
+        if i < num_segs - 1:
+            t.append(" ")
+    t.append("\n")
+
+    # Linha 3: Ponteiro ▲ alinhado ao centro do bloco ativo
+    ptr_offset = seg_idx * (seg_w + 1) + (seg_w // 2)
+    t.append(" " * ptr_offset)
+    t.append("▲\n", style="bold white")
+
+    # Linha 4: Valor em graus na cor correspondente do bloco ativo
+    temp_str = f"{temp:.1f}°C"
+    temp_offset = max(0, ptr_offset - (len(temp_str) // 2))
+    t.append(" " * temp_offset)
+    t.append(f"{temp_str}\n", style=f"bold {cur_color}")
+
+    # Linha 5: Escala inferior (0°C ... 100°C)
+    min_str = f"{min_t:.0f}°C"
+    max_str = f"{max_t:.0f}°C"
+    space_scale = max(4, total_bar_w - len(min_str) - len(max_str))
+    t.append(min_str, style="dim")
+    t.append(" " * space_scale)
+    t.append(max_str, style="dim")
+
+    return t
+
+# --- 2. GRÁFICO HISTOGRAMA VERTICAL (ESTILO SAMPLER BARCHART) ---
+
+def render_sampler_barchart(data, height=5, width=38, y_min=0, y_max=100):
+    gradient_palette = ["#ff2a6d", "#d946ef", "#a855f7", "#6366f1", "#05d9e8"]
+    if height > len(gradient_palette):
+        row_colors = ["#05d9e8"] * height
+    else:
+        row_colors = gradient_palette[:height]
+
+    raw_data = list(data) if data else [0]
+    if len(raw_data) < width:
+        col_data = [raw_data[0]] * (width - len(raw_data)) + raw_data
+    else:
+        col_data = raw_data[-width:]
+
+    span = y_max - y_min
+    if span <= 0:
+        span = 1.0
+    total_levels = height * 8
+
+    col_levels = []
+    for val in col_data:
+        clamped = max(y_min, min(y_max, val))
+        norm = (clamped - y_min) / span
+        col_levels.append(int(round(norm * total_levels)))
+
+    lines = []
+    for r in range(chart_r := height - 1, -1, -1):
+        line = ""
+        base_lvl = r * 8
+        color = row_colors[chart_r - r]
+        for lvl in col_levels:
+            rem = lvl - base_lvl
+            if rem <= 0:
+                line += " "
+            elif rem >= 8:
+                line += f"[{color}]█[/]"
+            else:
+                line += f"[{color}]{BLOCKS[rem]}[/]"
+
+        if r == chart_r:
+            line += f" [dim]{y_max:>3.0f}%[/]"
+        elif r == chart_r // 2:
+            mid = (y_max + y_min) / 2
+            line += f" [dim]{mid:>3.0f}%[/]"
+        elif r == 0:
+            line += f" [dim]{y_min:>3.0f}%[/]"
+        else:
+            line += "     "
+        lines.append(line)
+
+    cur_val = raw_data[-1] if raw_data else 0.0
+    avg_val = sum(raw_data) / len(raw_data) if raw_data else 0.0
+    max_val = max(raw_data) if raw_data else 0.0
+
+    stat_line = (
+        f"[dim]Atual:[/] [bold cyan]{cur_val:4.1f}%[/]   "
+        f"[dim]Média:[/] [white]{avg_val:4.1f}%[/]   "
+        f"[dim]Pico:[/] [bold #ff2a6d]{max_val:4.1f}%[/]"
+    )
+
+    return "\n".join(lines) + "\n" + stat_line
+
+# --- 3. GRÁFICO TIMELINE MULTI-SÉRIE (ESTILO SAMPLER RCHART) ---
+
+def render_sampler_linechart(series_list, labels_list, colors_list, height=5, format_str="{:2.0f}°C"):
+    chart_str = asciichartpy.plot(series_list, {
+        "height": height,
+        "format": format_str,
+        "colors": colors_list
+    })
+    text = Text.from_ansi(chart_str)
+    text.append("\n")
+
+    for i, (label, color_name) in enumerate(zip(labels_list, ["magenta", "green", "cyan"])):
+        series = series_list[i]
+        curr_val = series[-1] if series else 0
+        text.append("● ", style=color_name)
+        text.append(f"{label}: ", style="dim")
+        text.append(f"{curr_val:.0f}°C   ", style=f"bold {color_name}")
+
+    return text
+
+# --- 4. MEDIDOR DE NÍVEL ESTILO HTOP COM PIPES E GRADIENTE FRIO -> QUENTE ---
+
+def make_htop_pipe_bar(pct: float, width: int = 36) -> str:
+    """
+    Constrói o gauge no estilo htop usando colchetes e pipes '|',
+    com gradiente contínuo saindo da cor fria para a quente.
+    """
+    clamped = max(0.0, min(100.0, pct))
+    filled = int(round((clamped / 100.0) * width))
+    empty = max(0, width - filled)
+
+    parts = ["[dim][[/]"]
+    for i in range(filled):
+        c_idx = int(round((i / max(1, width - 1)) * (len(CORES) - 1)))
+        r, g, b = CORES[c_idx]
+        parts.append(f"[rgb({r},{g},{b})]|[/]")
+    parts.append(" " * empty)
+    parts.append("[dim]][/]")
+    return "".join(parts)
+
+
+class HardwareMonitor:
+    def __init__(self):
+        self.cpu_load_hist = deque(maxlen=HISTORY_LEN)
+        self.cpu_temp_hist = deque(maxlen=HISTORY_LEN)
+        self.gpu_temp_hist = deque(maxlen=HISTORY_LEN)
+        self.fan_rpm_hist = deque(maxlen=HISTORY_LEN)
+        self.ram_hist = deque(maxlen=HISTORY_LEN)
+
+    def fetch_sensors(self):
+        temps = {}
+        try:
+            raw_temps = psutil.sensors_temperatures()
+            if 'coretemp' in raw_temps:
+                for s in raw_temps['coretemp']:
+                    lbl = s.label or 'Package'
+                    temps[lbl] = s.current
+            if 'dell_smm' in raw_temps:
+                for s in raw_temps['dell_smm']:
+                    temps[f"dell_{s.label}"] = s.current
+            if 'pch_skylake' in raw_temps and raw_temps['pch_skylake']:
+                temps['PCH'] = raw_temps['pch_skylake'][0].current
+            if 'nvme' in raw_temps:
+                for s in raw_temps['nvme']:
+                    if s.label == 'Composite':
+                        temps['NVMe'] = s.current
+        except Exception:
+            pass
+
+        # Fan
+        fan_rpm = 0
+        try:
+            raw_fans = psutil.sensors_fans()
+            if 'dell_smm' in raw_fans and raw_fans['dell_smm']:
+                fan_rpm = raw_fans['dell_smm'][0].current
+        except Exception:
+            pass
+
+        # NVIDIA GPU
+        nvidia = None
+        try:
+            out = subprocess.check_output(
+                ['nvidia-smi', '--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total',
+                 '--format=csv,noheader,nounits'],
+                text=True, timeout=0.4, stderr=subprocess.DEVNULL
+            ).strip()
+            parts = [p.strip() for p in out.split(',')]
+            nvidia = {
+                'util': float(parts[0]),
+                'temp': float(parts[1]),
+                'mem_used': float(parts[2]),
+                'mem_total': float(parts[3]),
+            }
+        except Exception:
+            pass
+
+        # Intel GPU (UHD 620 via sysfs)
+        intel = {}
+        for prop in ['gt_act_freq_mhz', 'gt_cur_freq_mhz', 'gt_max_freq_mhz']:
+            p = f"/sys/class/drm/card1/{prop}"
+            if os.path.exists(p):
+                try:
+                    with open(p) as f:
+                        intel[prop] = int(f.read().strip())
+                except Exception:
+                    pass
+
+        # CPU load & frequencies
+        cpu_total = psutil.cpu_percent(interval=None)
+        cpu_cores = psutil.cpu_percent(interval=None, percpu=True)
+        cpu_freqs = psutil.cpu_freq(percpu=True) or []
+
+        # RAM & Swap
+        vmem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+
+        # Disco
+        disk = None
+        try:
+            disk = psutil.disk_usage('/')
+        except Exception:
+            pass
+
+        # Top CPU processes (com porcentagem de memória)
+        top_procs = []
+        try:
+            for p in sorted(psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']),
+                            key=lambda x: (x.info['cpu_percent'] or 0), reverse=True)[:6]:
+                info = p.info
+                if (info['cpu_percent'] or 0) > 0.1:
+                    top_procs.append(info)
+        except Exception:
+            pass
+
+        # Temperatura mestre geral
+        pkg_temp = temps.get('Package id 0', temps.get('CPU', temps.get('dell_CPU', 0)))
+        if pkg_temp == 0:
+            try:
+                with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                    pkg_temp = int(f.read().strip()) / 1000.0
+            except Exception:
+                pkg_temp = 50.0
+
+        gpu_temp = (nvidia['temp'] if nvidia else temps.get('dell_GPU', 45.0))
+
+        # Seed inicial para gráficos
+        if not self.cpu_load_hist:
+            for _ in range(16):
+                self.cpu_load_hist.append(cpu_total)
+                self.cpu_temp_hist.append(pkg_temp)
+                self.gpu_temp_hist.append(gpu_temp)
+        else:
+            self.cpu_load_hist.append(cpu_total)
+            self.cpu_temp_hist.append(pkg_temp)
+            self.gpu_temp_hist.append(gpu_temp)
+
+        self.fan_rpm_hist.append(fan_rpm)
+        self.ram_hist.append(vmem.percent)
+
+        return {
+            'temps': temps,
+            'fan_rpm': fan_rpm,
+            'nvidia': nvidia,
+            'intel': intel,
+            'cpu_total': cpu_total,
+            'cpu_cores': cpu_cores,
+            'cpu_freqs': cpu_freqs,
+            'vmem': vmem,
+            'swap': swap,
+            'disk': disk,
+            'top_procs': top_procs,
+            'pkg_temp': pkg_temp,
+            'gpu_temp': gpu_temp,
+        }
+
+    def render(self, data: dict, console: Console, force_compact: bool = False, show_charts: bool = True) -> Group:
+        term_w = console.width
+        term_h = console.height
+
+        temps = data['temps']
+        pkg_temp = data['pkg_temp']
+        fan_rpm = data['fan_rpm']
+        nvidia = data['nvidia']
+        intel = data['intel']
+        vmem = data['vmem']
+        swap = data['swap']
+
+        # --- 1. TERMÔMETRO MESTRE (CENTRALIZADO) ---
+        seg_w = 4 if term_w >= 90 else 3
+        master_therm = Align.center(build_master_thermometer(pkg_temp, min_t=0, max_t=100, seg_w=seg_w))
+
+        # --- 2. LINHA DO SISTEMA COM ESPAÇAMENTO ---
+        uptime_sec = time.time() - psutil.boot_time()
+        hours, rem = divmod(int(uptime_sec), 3600)
+        minutes, _ = divmod(rem, 60)
+        days, hours = divmod(hours, 24)
+        uptime_str = f"{days}d {hours}h {minutes}m" if days > 0 else f"{hours}h {minutes}m"
+        load1, load5, load15 = os.getloadavg()
+
+        header_table = Table(box=None, expand=True, padding=(0, 1), show_header=False)
+        header_table.add_column("Host", justify="left")
+        header_table.add_column("Uptime", justify="center")
+        header_table.add_column("Carga", justify="right")
+
+        header_table.add_row(
+            "[bold bright_white]Dell Inspiron (cst-tux)[/] [dim]| Core i7-8550U (4C/8T)[/]",
+            f"[dim]Uptime:[/] [cyan]{uptime_str}[/]",
+            f"[dim]Load:[/] [bold cyan]{load1:.2f}[/] [dim]{load5:.2f} {load15:.2f}[/]"
+        )
+
+        use_two_columns = (term_w >= 88) and not force_compact
+        if use_two_columns:
+            col_w = (term_w - 2) // 2
+            inner_w = max(24, col_w - 4)
+        else:
+            col_w = term_w - 2
+            inner_w = max(24, col_w - 4)
+
+        bar_w = max(16, inner_w - 2)
+
+        # Se houver altura disponível para exibir tanto os gráficos quanto os medidores sem rolagem
+        can_fit_both = (term_h >= 28) and show_charts
+
+        # --- 3. LINHA DE GAUGES & NÍVEIS NO ESTILO HTOP COM PIPES ---
+        ram_used_gb = vmem.used / (1024**3)
+        ram_total_gb = vmem.total / (1024**3)
+        avail_gb = vmem.available / (1024**3)
+
+        swap_used_mb = swap.used / (1024**2)
+        swap_total_mb = swap.total / (1024**2)
+        swap_free_gb = (swap.total - swap.used) / (1024**3)
+
+        fan_pct = min(100.0, (fan_rpm / 5800.0) * 100.0 if fan_rpm > 0 else 0.0)
+        fan_badge = "[green][BAIXO][/]" if fan_rpm < 2800 else ("[yellow][MÉDIO][/]" if fan_rpm < 4200 else "[bold #ff2a6d][ALTO][/]")
+
+        gauge_lines = [
+            f"[bold cyan]Cooler Fan[/]    [white]{fan_rpm} RPM[/]  [dim]({fan_pct:.0f}%)[/]  {fan_badge}",
+            make_htop_pipe_bar(fan_pct, bar_w),
+            f"[bold magenta]Memória RAM[/]   [white]{ram_used_gb:.1f}/{ram_total_gb:.1f} GiB[/]  [dim]({vmem.percent:.0f}%)[/]  [dim]Disp: {avail_gb:.1f}G[/]",
+            make_htop_pipe_bar(vmem.percent, bar_w),
+            f"[bold yellow]Swap Cache[/]    [white]{swap_used_mb:.0f}/{swap_total_mb:.0f} MiB[/]  [dim]({swap.percent:.0f}%)[/]  [dim]Livre: {swap_free_gb:.1f}G[/]",
+            make_htop_pipe_bar(swap.percent, bar_w),
+        ]
+
+        disk = data.get('disk')
+        if disk:
+            disk_used_gb = disk.used / (1024**3)
+            disk_total_gb = disk.total / (1024**3)
+            disk_free_gb = disk.free / (1024**3)
+            gauge_lines.extend([
+                f"[bold #05d9e8]Disco SSD (/)[/] [white]{disk_used_gb:.0f}/{disk_total_gb:.0f} GiB[/]  [dim]({disk.percent:.0f}%)[/]  [dim]Livre: {disk_free_gb:.0f}G[/]",
+                make_htop_pipe_bar(disk.percent, bar_w)
+            ])
+        elif nvidia:
+            vram_used = nvidia['mem_used']
+            vram_total = nvidia['mem_total']
+            vram_pct = (vram_used / vram_total) * 100.0 if vram_total > 0 else 0.0
+            gauge_lines.extend([
+                f"[bold green]GPU VRAM (MX150)[/] [white]{vram_used:.0f}/{vram_total:.0f}M[/]  [dim]({vram_pct:.0f}%)[/]",
+                make_htop_pipe_bar(vram_pct, bar_w)
+            ])
+        else:
+            gauge_lines.extend([
+                "[dim]Disco SSD (/)[/] [dim]-- / -- GiB (0%)[/]",
+                make_htop_pipe_bar(0, bar_w)
+            ])
+
+        p_gauges = Panel(
+            Text.from_markup("\n".join(gauge_lines)),
+            title="[bold cyan] Hardware Gauges & Levels [/]",
+            title_align="left",
+            border_style="white",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True
+        )
+
+        # --- 4. SENSORES & TABELA TOP CPU COM RESPIRO ---
+        dell_amb = temps.get('dell_Ambient', 0)
+        sodimm = temps.get('dell_SODIMM', 0)
+        nvme = temps.get('NVMe', 0)
+        pch = temps.get('PCH', 0)
+
+        sensors_line = f"[dim]Sensores:[/]  [white]NVMe {nvme:.0f}°[/]   [white]PCH {pch:.0f}°[/]   [white]RAM {sodimm:.0f}°[/]"
+
+        core_labels = ['Core 0', 'Core 1', 'Core 2', 'Core 3']
+        freqs = data['cpu_freqs']
+        cores_parts = []
+        for i, lbl in enumerate(core_labels):
+            t_core = temps.get(lbl, 0)
+            col = "green" if t_core < 65 else ("yellow" if t_core < 80 else "#ff2a6d")
+            cores_parts.append(f"[{col}]C{i}:{t_core:.0f}°[/]")
+        avg_freq = sum(f.current for f in freqs) / (len(freqs) * 1000.0) if freqs else 0.0
+        cores_text = " ".join(cores_parts)
+        if avg_freq > 0:
+            cores_text += f" [dim]({avg_freq:.1f}G)[/]"
+        cores_line = f"[dim]Núcleos:[/]   {cores_text}"
+
+        cur_freq = intel.get('gt_cur_freq_mhz', 300)
+        gpu_info_parts = [f"[white]UHD: {cur_freq}MHz[/]"]
+        if nvidia and nvidia.get('temp', 0) > 0:
+            gpu_info_parts.append(f"[dim]MX150:[/] [white]{nvidia['temp']:.0f}°[/]")
+        gpu_info_parts.append(f"[dim]Amb:[/] [white]{dell_amb:.0f}°[/]")
+        graphics_line = f"[dim]Gráficos:[/]  {' • '.join(gpu_info_parts)}"
+
+        # Tabela Top CPU com exatamente 3 processos para manter 8 linhas perfeitamente alinhadas
+        proc_lines = []
+        for p in data['top_procs'][:3]:
+            pid = p.get('pid', 0)
+            p_name = p.get('name', 'unknown')[:14]
+            cpu_p = p.get('cpu_percent', 0.0) or 0.0
+            mem_p = p.get('memory_percent', 0.0) or 0.0
+            col = "#ff2a6d" if cpu_p > 70 else ("yellow" if cpu_p > 25 else "cyan")
+            proc_lines.append(f" {pid:>5}  {p_name:<14}  [{col}]{cpu_p:>5.1f}%[/]   [dim]{mem_p:>4.1f}%[/]")
+
+        while len(proc_lines) < 3:
+            proc_lines.append(" [dim]   --  --                 --%     --%[/]")
+
+        info_lines = [
+            sensors_line,
+            cores_line,
+            graphics_line,
+            f"[dim]{'─' * inner_w}[/]",
+            "[bold white]PID    PROCESSO           CPU%    MEM%[/]",
+        ] + proc_lines
+
+        p_info = Panel(
+            Text.from_markup("\n".join(info_lines)),
+            title="[bold green] Sensors & Top CPU Processes [/]",
+            title_align="left",
+            border_style="white",
+            box=box.ROUNDED,
+            padding=(0, 1),
+            expand=True
+        )
+
+        # Montagem dos cards de Gauges & Info
+        if use_two_columns:
+            gauges_table = Table(width=term_w, show_header=False, box=None, padding=(0, 1), pad_edge=False, expand=True)
+            gauges_table.add_column(ratio=1)
+            gauges_table.add_column(ratio=1)
+            gauges_table.add_row(p_gauges, p_info)
+            gauges_row = gauges_table
+        else:
+            gauges_row = Group(p_gauges, Text(""), p_info)
+
+        # --- 5. GRÁFICOS 2D HISTÓRICOS (SE HOUVER ESPAÇO) ---
+        charts_row = None
+        if can_fit_both:
+            target_chart_w = max(18, col_w - 10)
+            chart_barchart_text = render_sampler_barchart(
+                self.cpu_load_hist, height=5, width=target_chart_w, y_min=0, y_max=100
+            )
+            p_cpu_chart = Panel(
+                Text.from_markup(chart_barchart_text),
+                title="[bold #05d9e8] CPU Usage History [/]",
+                title_align="left",
+                border_style="white",
+                box=box.ROUNDED,
+                padding=(0, 1)
+            )
+
+            target_line_pts = max(16, min(len(self.cpu_temp_hist), col_w - 12))
+            pts_cpu = list(self.cpu_temp_hist)[-target_line_pts:]
+            pts_gpu = list(self.gpu_temp_hist)[-target_line_pts:]
+            min_len = min(len(pts_cpu), len(pts_gpu))
+
+            linechart_content = render_sampler_linechart(
+                [pts_cpu[-min_len:], pts_gpu[-min_len:]],
+                labels_list=["CPU Pkg", "GPU MX150"],
+                colors_list=[asciichartpy.magenta, asciichartpy.green],
+                height=4,
+                format_str="{:2.0f}°C"
+            )
+            p_temp_chart = Panel(
+                linechart_content,
+                title="[bold magenta] Thermal Timeline (°C) [/]",
+                title_align="left",
+                border_style="white",
+                box=box.ROUNDED,
+                padding=(0, 1)
+            )
+
+            if use_two_columns:
+                c_table = Table(width=term_w, show_header=False, box=None, padding=(0, 1), pad_edge=False, expand=True)
+                c_table.add_column(ratio=1)
+                c_table.add_column(ratio=1)
+                c_table.add_row(p_cpu_chart, p_temp_chart)
+                charts_row = c_table
+            else:
+                charts_row = Group(p_cpu_chart, Text(""), p_temp_chart)
+
+        # --- 6. MONTAGEM FINAL COM MARGENS E RESPIRO ---
+        elements = [
+            Text(""),             # Margem superior antes do termômetro
+            master_therm,         # Termômetro mestre centralizado
+            Text(""),             # Margem inferior após o termômetro
+            header_table,         # Linha do sistema
+            Text("")              # Espaçamento para os cards
+        ]
+
+        if charts_row:
+            elements.append(charts_row)
+            elements.append(Text(""))  # Espaçamento entre os gráficos e os medidores
+
+        elements.append(gauges_row)
+        elements.append(Text(""))      # Margem antes do rodapé
+
+        # Rodapé
+        footer_text = Text()
+        footer_text.append("Comandos: ", style="dim")
+        footer_text.append("[q]", style="bold cyan")
+        footer_text.append(" Sair  ", style="dim")
+        footer_text.append("[Espaço]", style="bold cyan")
+        footer_text.append(" Pausar  ", style="dim")
+        footer_text.append("[1]", style="bold cyan")
+        footer_text.append(" 1s  ", style="dim")
+        footer_text.append("[2]", style="bold cyan")
+        footer_text.append(" 2s  ", style="dim")
+        footer_text.append("[c]", style="bold cyan")
+        footer_text.append(" Layout  ", style="dim")
+        footer_text.append(f"| {datetime.now().strftime('%H:%M:%S')}", style="dim")
+
+        elements.append(footer_text)
+
+        return Group(*elements)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Monitor visual estilo Sampler com termômetro mestre de saúde do CST-TUX."
+    )
+    parser.add_argument("-1", "--once", action="store_true",
+                        help="Exibe uma captura única das métricas e sai (ideal para scripts ou terminal rápido).")
+    parser.add_argument("-i", "--interval", type=float, default=1.5,
+                        help="Intervalo de atualização em segundos no modo contínuo (padrão: 1.5s).")
+    parser.add_argument("-c", "--compact", action="store_true",
+                        help="Força exibição compacta em pilha vertical.")
+    args = parser.parse_args()
+
+    console = Console(color_system="truecolor")
+    monitor = HardwareMonitor()
+
+    # Calibração inicial de psutil.cpu_percent e processos
+    psutil.cpu_percent(interval=None)
+    for p in psutil.process_iter(['cpu_percent']):
+        try:
+            p.cpu_percent()
+        except Exception:
+            pass
+
+    if args.once:
+        time.sleep(0.15)
+        data = monitor.fetch_sensors()
+        renderable = monitor.render(data, console=console, force_compact=args.compact)
+        console.print(renderable)
+        return
+
+    interval = args.interval
+    paused = False
+    force_compact = args.compact
+
+    try:
+        with Live(console=console, screen=True, auto_refresh=False) as live:
+            while True:
+                if not paused:
+                    data = monitor.fetch_sensors()
+                    renderable = monitor.render(data, console=console, force_compact=force_compact)
+                    live.update(renderable, refresh=True)
+
+                if sys.stdin.isatty():
+                    rlist, _, _ = select.select([sys.stdin], [], [], interval)
+                    if rlist:
+                        key = sys.stdin.read(1).lower()
+                        if key in ['q', '\x03', '\x1b']:
+                            break
+                        elif key == ' ':
+                            paused = not paused
+                        elif key == '1':
+                            interval = 1.0
+                        elif key == '2':
+                            interval = 2.0
+                        elif key == 'c':
+                            force_compact = not force_compact
+                            data = monitor.fetch_sensors()
+                            renderable = monitor.render(data, console=console, force_compact=force_compact)
+                            live.update(renderable, refresh=True)
+                else:
+                    time.sleep(interval)
+
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()
