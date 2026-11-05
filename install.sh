@@ -27,6 +27,14 @@ ln -sf "${SCRIPT_DIR}/sys-temp" "${BIN_DIR}/tempmon"
 ln -sf "${SCRIPT_DIR}/sys-temp" "${HOME}/bin/sys-temp"
 ln -sf "${SCRIPT_DIR}/sys-temp" "${HOME}/bin/tempmon"
 
+echo "==> Configurando diretório de configuração (~/.config/sys-temp)..."
+mkdir -p "${HOME}/.config/sys-temp"
+if [ ! -f "${HOME}/.config/sys-temp/alert.env" ]; then
+    cp "${SCRIPT_DIR}/alert.env.example" "${HOME}/.config/sys-temp/alert.env"
+    chmod 600 "${HOME}/.config/sys-temp/alert.env"
+    echo "✔ Modelo criado em ~/.config/sys-temp/alert.env (configure seu TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID)"
+fi
+
 echo "==> Verificando PATH..."
 case ":$PATH:" in
   *":${BIN_DIR}:"*) ;;
@@ -35,4 +43,5 @@ esac
 
 echo ""
 echo "✔ Instalação concluída com sucesso!"
-echo "Execute: sys-temp (ou tempmon)"
+echo "• Monitor no terminal: sys-temp (ou tempmon)"
+echo "• Daemon de alertas:   sys-temp daemon help"

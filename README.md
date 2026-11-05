@@ -137,7 +137,58 @@ sys-temp -c
 | <kbd>Espaço</kbd> | Pausa / Retoma a atualização em tempo real |
 | <kbd>1</kbd> | Ajusta taxa de atualização para **1 segundo** |
 | <kbd>2</kbd> | Ajusta taxa de atualização para **2 segundos** |
-| <kbd>c</kbd> | Alterna entre layout em colunas e layout compacto |
+| <kbd>c</kbd> | Alterna entre layout **Completo**, **Focado** e **Compacto** |
+
+---
+
+## 🤖 Daemon de Alerta Térmico & Watchdog Telegram
+
+O `sys-temp` inclui um daemon de monitoramento preventivo que executa em segundo plano via `systemd --user`.
+
+### 🛡️ Como Funciona o Watchdog:
+1. **Monitoramento Contínuo**: Avalia as temperaturas do processador a cada 5 segundos.
+2. **Alerta Preventivo no Telegram**: Se a temperatura atingir **85°C+ por 2 minutos contínuos**, o daemon envia um alerta com a identificação do processo responsável pelo maior consumo de CPU (PID, nome e % de uso).
+3. **Contagem Regressiva de Ação (5 minutos)**: Dá tolerância de 5 minutos para o usuário interagir.
+4. **Encerramento Automático**: Se o calor extremo persistir e o usuário não intervir, o daemon finaliza o processo ofensor (com `SIGTERM` gracioso e escala para `SIGKILL` se travar), avisando imediatamente no Telegram.
+5. **Aviso de Normalização**: Quando a temperatura cai abaixo de 75°C, o daemon envia confirmação de resfriamento.
+
+### 📱 Comandos Interativos no Telegram:
+Você pode enviar mensagens diretamente ao bot para gerenciar seu notebook:
+- `/status` — Consulta telemetria em tempo real (temperaturas, fan RPM e top processos).
+- `/cancelar_kill` — Aborta a finalização automática do processo agendada pelo watchdog.
+- `/matar_agora` — Encerra imediatamente o processo ofensor sem esperar os 5 minutos.
+- `/ajuda` — Exibe a lista de comandos e configurações ativas.
+
+### ⚙️ Configuração (~/.config/sys-temp/alert.env)
+
+Edite o arquivo `~/.config/sys-temp/alert.env` e defina seu token e chat ID:
+
+```env
+TELEGRAM_BOT_TOKEN=seu_token_aqui_gerado_no_botfather
+TELEGRAM_CHAT_ID=seu_id_de_usuario_no_telegram
+TEMP_THRESHOLD=85.0
+ALERT_DELAY_SECONDS=120
+KILL_DELAY_SECONDS=300
+```
+
+### 🚀 Gerenciando o Daemon com a CLI:
+
+```bash
+# Validar se o token e o chat ID estão corretos (envia mensagem de teste):
+sys-temp daemon test-telegram
+
+# Instalar e habilitar o serviço no systemd do usuário:
+sys-temp daemon install
+
+# Visualizar status e logs:
+sys-temp daemon status
+sys-temp daemon logs
+
+# Controlar o serviço:
+sys-temp daemon stop
+sys-temp daemon start
+sys-temp daemon restart
+```
 
 ---
 
