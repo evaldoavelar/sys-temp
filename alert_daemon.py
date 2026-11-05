@@ -109,11 +109,37 @@ class TelegramBot:
         req = urllib.request.Request(f"{self.base_url}/sendMessage", data=data)
 
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 return res.get("ok", False)
         except Exception as e:
             logger.error(f"Falha ao enviar mensagem Telegram: {e}")
+            return False
+
+    def register_commands(self) -> bool:
+        """Registra os comandos oficiais no menu do Telegram via setMyCommands."""
+        if not self.token:
+            return False
+
+        commands = [
+            {"command": "status", "description": "Telemetria atual (temperatura, fan, processos)"},
+            {"command": "matar_agora", "description": "Encerra imediatamente o processo ofensor"},
+            {"command": "cancelar_kill", "description": "Aborta a finalização preventiva"},
+            {"command": "ajuda", "description": "Exibe ajuda e comandos disponíveis"}
+        ]
+        url = f"{self.base_url}/setMyCommands"
+        data = json.dumps({"commands": commands}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                if res.get("ok"):
+                    logger.info("Comandos oficiais do Telegram registrados com sucesso via setMyCommands.")
+                    return True
+                return False
+        except Exception as e:
+            logger.warning(f"Não foi possível registrar comandos no Telegram: {e}")
             return False
 
     def get_updates(self, offset: int = None, timeout: int = 20) -> list:
@@ -160,6 +186,17 @@ def read_system_temperature() -> float:
         pass
 
     try:
+        import glob
+        for tz_type in glob.glob("/sys/class/thermal/thermal_zone*/type"):
+            with open(tz_type) as f:
+                if "x86_pkg_temp" in f.read():
+                    t_file = tz_type.replace("/type", "/temp")
+                    with open(t_file) as tf:
+                        return int(tf.read().strip()) / 1000.0
+    except Exception:
+        pass
+
+    try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
             return int(f.read().strip()) / 1000.0
     except Exception:
@@ -175,6 +212,32 @@ def read_system_fan_rpm() -> int:
     except Exception:
         pass
     return 0
+
+
+def get_root_offender(pid: int, protected_list: list) -> int:
+    """Retorna o PID do processo raiz não-protegido pertencente ao usuário que gerou o PID atual (ex: script pai que disparou workers)."""
+    try:
+        proc = psutil.Process(pid)
+    except Exception:
+        return pid
+
+    curr = proc
+    current_uid = os.getuid()
+    while True:
+        try:
+            parent = curr.parent()
+            if not parent or parent.pid <= 1:
+                break
+            if parent.uids().real != current_uid:
+                break
+            p_name = (parent.name() or '').lower()
+            p_cmd = " ".join(parent.cmdline() or []).lower()
+            if any(prot in p_name or prot in p_cmd for prot in protected_list):
+                break
+            curr = parent
+        except Exception:
+            break
+    return curr.pid
 
 
 def find_top_offender_process(protected_list: list) -> dict | None:
@@ -199,7 +262,8 @@ def find_top_offender_process(protected_list: list) -> dict | None:
                 continue
 
             name = (info['name'] or '').lower()
-            if any(prot in name for prot in protected_list):
+            cmd_str = " ".join(info['cmdline'] or []).lower()
+            if any(prot in name or prot in cmd_str for prot in protected_list):
                 continue
 
             cpu_p = info['cpu_percent'] or 0.0
@@ -218,43 +282,97 @@ def find_top_offender_process(protected_list: list) -> dict | None:
         return None
 
     candidates.sort(key=lambda x: x['cpu_percent'], reverse=True)
-    return candidates[0]
+    top = candidates[0]
+
+    # Identifica o processo raiz não-protegido da árvore
+    root_pid = get_root_offender(top['pid'], protected_list)
+    if root_pid != top['pid']:
+        try:
+            r_proc = psutil.Process(root_pid)
+            total_cpu = top['cpu_percent']
+            for child in r_proc.children(recursive=True):
+                try:
+                    if child.pid != top['pid']:
+                        c_p = child.cpu_percent()
+                        if c_p:
+                            total_cpu += c_p
+                except Exception:
+                    pass
+            return {
+                'pid': root_pid,
+                'name': r_proc.name(),
+                'cpu_percent': total_cpu,
+                'memory_percent': r_proc.memory_percent() or top['memory_percent'],
+                'cmdline': " ".join(r_proc.cmdline() or [])[:80]
+            }
+        except Exception:
+            pass
+
+    return top
 
 
 def terminate_offender(pid: int, name: str, timeout: int = 10) -> bool:
-    """Encerra processo ofensor com SIGTERM e escala para SIGKILL se necessário."""
+    """Encerra processo ofensor e toda a sua árvore de subprocessos com SIGTERM e escala para SIGKILL se necessário."""
+    pids_to_kill = [pid]
     try:
-        logger.warning(f"Enviando SIGTERM para o processo ofensor {name} (PID: {pid})...")
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    except Exception as e:
-        logger.error(f"Erro ao enviar SIGTERM para PID {pid}: {e}")
-        return False
+        proc = psutil.Process(pid)
+        for child in proc.children(recursive=True):
+            pids_to_kill.append(child.pid)
+    except Exception:
+        pass
 
-    # Aguarda saída graciosa por até timeout segundos
+    # Garante lista única preservando ordem (filhos primeiro, depois o pai)
+    pids_to_kill = list(dict.fromkeys(reversed(pids_to_kill)))
+    logger.warning(f"Enviando SIGTERM para a árvore do processo {name} (PIDs: {pids_to_kill})...")
+
+    for p in pids_to_kill:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.error(f"Erro ao enviar SIGTERM para PID {p}: {e}")
+
+    # Aguarda encerramento gracioso por até timeout segundos
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-            time.sleep(0.5)
-        except ProcessLookupError:
-            logger.info(f"Processo {name} (PID: {pid}) encerrou graciosamente com SIGTERM.")
+        alive_pids = []
+        for p in pids_to_kill:
+            try:
+                os.kill(p, 0)
+                alive_pids.append(p)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+        if not alive_pids:
+            logger.info(f"Processo {name} e todos os subprocessos ({pids_to_kill}) encerraram graciosamente com SIGTERM.")
             return True
-        except Exception:
-            break
-
-    # Se ainda estiver vivo, força SIGKILL
-    try:
-        logger.warning(f"Processo {name} (PID: {pid}) não encerrou no prazo. Enviando SIGKILL forçado...")
-        os.kill(pid, signal.SIGKILL)
         time.sleep(0.5)
-        return True
-    except ProcessLookupError:
-        return True
-    except Exception as e:
-        logger.error(f"Erro ao enviar SIGKILL para PID {pid}: {e}")
-        return False
+
+    # Se ainda houver processos vivos, força SIGKILL
+    remaining = []
+    for p in pids_to_kill:
+        try:
+            os.kill(p, 0)
+            remaining.append(p)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+
+    if remaining:
+        logger.warning(f"Processos {remaining} não encerraram no prazo. Enviando SIGKILL forçado...")
+        for p in remaining:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                logger.error(f"Erro ao enviar SIGKILL para PID {p}: {e}")
+        time.sleep(0.5)
+
+    return True
 
 
 class ThermalAlertDaemon:
@@ -323,12 +441,15 @@ class ThermalAlertDaemon:
             logger.warning(f"Tentativa de comando de usuário não autorizado: {from_id}")
             return "⛔ <b>Acesso Negado:</b> Você não está autorizado a interagir com este watchdog."
 
-        cmd = cmd.strip().lower()
+        raw_cmd = cmd.strip()
+        clean_cmd = raw_cmd.split()[0].split("@")[0].lower()
+        if not clean_cmd.startswith("/"):
+            clean_cmd = "/" + clean_cmd
 
-        if cmd in ("/status", "/stats"):
+        if clean_cmd in ("/status", "/stats"):
             return self.get_status_report()
 
-        elif cmd in ("/cancelar_kill", "/cancelar", "/abort"):
+        elif clean_cmd in ("/cancelar_kill", "/cancelar", "/abort"):
             if self.pending_kill and not self.kill_cancelled:
                 self.kill_cancelled = True
                 pid = self.pending_kill['pid']
@@ -338,7 +459,7 @@ class ThermalAlertDaemon:
             else:
                 return "ℹ️ Não há nenhuma finalização de processo agendada no momento."
 
-        elif cmd in ("/matar_agora", "/kill", "/encerrar"):
+        elif clean_cmd in ("/matar_agora", "/kill", "/encerrar"):
             if self.pending_kill:
                 pid = self.pending_kill['pid']
                 name = self.pending_kill['name']
@@ -346,7 +467,7 @@ class ThermalAlertDaemon:
                 self.pending_kill = None
                 self.kill_cancelled = True
                 if success:
-                    return f"🛑 <b>Processo Finalizado com Sucesso:</b>\n<code>{name}</code> (PID {pid}) foi encerrado imediatamente."
+                    return f"🛑 <b>Processo Finalizado com Sucesso:</b>\n<code>{name}</code> (PID {pid}) e sua árvore foram encerrados imediatamente."
                 else:
                     return f"⚠️ Falha ao encerrar <code>{name}</code> (PID {pid}). Verifique os logs."
             else:
@@ -354,30 +475,40 @@ class ThermalAlertDaemon:
                 if offender:
                     success = terminate_offender(offender['pid'], offender['name'])
                     if success:
-                        return f"🛑 <b>Top Processo Finalizado:</b>\n<code>{offender['name']}</code> (PID {offender['pid']}, {offender['cpu_percent']:.1f}% CPU) foi encerrado."
+                        return f"🛑 <b>Top Processo Finalizado:</b>\n<code>{offender['name']}</code> (PID {offender['pid']}, {offender['cpu_percent']:.1f}% CPU) e subprocessos foram encerrados."
                     else:
                         return f"⚠️ Falha ao tentar encerrar PID {offender['pid']}."
                 else:
                     return "ℹ️ Nenhum processo ofensor de usuário consumindo CPU acima do normal."
 
-        elif cmd in ("/ajuda", "/help", "/start"):
+        elif clean_cmd in ("/ajuda", "/help", "/start"):
             return (
                 "🤖 <b>Comandos do Watchdog sys-temp:</b>\n"
                 "━━━━━━━━━━━━━━━━━━━\n"
                 "• /status - Consulta telemetria de temperatura, fan e processos\n"
+                "• /matar_agora - Encerra imediatamente o processo que estiver aquecendo a CPU\n"
                 "• /cancelar_kill - Cancela a contagem regressiva de encerramento\n"
-                "• /matar_agora - Encerra imediatamente o processo ofensor\n"
                 "• /ajuda - Exibe este guia de comandos\n\n"
                 f"⚙️ <i>Limiar térmico atual: {self.config['TEMP_THRESHOLD']:.0f}°C por {self.config['ALERT_DELAY_SECONDS']}s</i>"
             )
 
-        return "❓ Comando não reconhecido. Digite /ajuda para ver as opções disponíveis."
+        return (
+            "❓ <b>Comando não reconhecido.</b>\n\n"
+            "Use o menu [ / ] ou envie um dos comandos:\n"
+            "• /status - Ver temperatura e processos\n"
+            "• /matar_agora - Finalizar processo ofensor\n"
+            "• /cancelar_kill - Abortar finalização programada\n"
+            "• /ajuda - Guia completo"
+        )
 
     def polling_loop(self):
         """Thread secundária que realiza long polling no Telegram para receber comandos."""
         if not self.config["ENABLE_TELEGRAM_POLLING"]:
             logger.info("Telegram Polling desativado nas configurações (ENABLE_TELEGRAM_POLLING=false).")
             return
+
+        # Registra comandos no menu oficial do Telegram
+        self.bot.register_commands()
 
         last_update_id = None
         logger.info("Iniciando escuta de comandos interativos no Telegram...")
@@ -395,9 +526,23 @@ class ThermalAlertDaemon:
                     from_user = msg.get("from") or {}
                     from_id = from_user.get("id") or msg.get("chat", {}).get("id")
 
+                    if not text:
+                        continue
+
                     if text.startswith("/"):
                         logger.info(f"Comando recebido de {from_id}: {text}")
                         reply = self.handle_command(text, from_id)
+                        self.bot.send_message(reply, chat_id=str(from_id))
+                    else:
+                        logger.info(f"Mensagem de texto livre recebida de {from_id}: {text}")
+                        reply = (
+                            "👋 Olá! Sou o <b>sys-temp Watchdog</b>.\n\n"
+                            "Você pode usar o menu <b>[ / ]</b> do Telegram ou enviar:\n"
+                            "• /status - Telemetria atual da máquina\n"
+                            "• /matar_agora - Encerrar processo que estiver aquecendo a CPU\n"
+                            "• /cancelar_kill - Cancelar encerramento programado\n"
+                            "• /ajuda - Guia de comandos"
+                        )
                         self.bot.send_message(reply, chat_id=str(from_id))
 
             except Exception as e:
@@ -481,6 +626,22 @@ class ThermalAlertDaemon:
 
                     self.bot.send_message(msg)
                     self.pending_kill = None
+                    self.last_kill_time = time.time()
+
+            # Se o ofensor foi finalizado mas a temperatura continua crítica após 30s adicionais
+            elif self.alert_sent and self.pending_kill is None and not self.kill_cancelled:
+                if hasattr(self, 'last_kill_time') and (time.time() - self.last_kill_time) >= 30:
+                    new_offender = find_top_offender_process(self.config["PROTECTED_PROCESSES"])
+                    if new_offender:
+                        logger.warning(f"Temperatura ainda crítica ({temp:.1f}°C). Novo ofensor identificado: {new_offender['name']} (PID: {new_offender['pid']})")
+                        self.pending_kill = new_offender
+                        self.kill_countdown_start = time.time()
+                        re_msg = (
+                            f"⚠️ <b>TEMPERATURA AINDA CRÍTICA ({temp:.1f}°C)</b>\n"
+                            f"Novo processo ofensor detectado: <code>{new_offender['name']}</code> (PID: <code>{new_offender['pid']}</code>, CPU: {new_offender['cpu_percent']:.1f}%).\n"
+                            f"Finalização automática programada caso persista."
+                        )
+                        self.bot.send_message(re_msg)
 
         else:
             # Temperatura abaixo do threshold
