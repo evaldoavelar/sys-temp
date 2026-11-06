@@ -46,6 +46,9 @@ def load_config() -> dict:
         "ALERT_DELAY_SECONDS": int(os.getenv("ALERT_DELAY_SECONDS", "120")),
         "KILL_DELAY_SECONDS": int(os.getenv("KILL_DELAY_SECONDS", "300")),
         "RECOVERY_THRESHOLD": float(os.getenv("RECOVERY_THRESHOLD", "75.0")),
+        "THROTTLE_FIRST": os.getenv("THROTTLE_FIRST", "true").lower() in ("true", "1", "yes"),
+        "THROTTLE_CPUS": float(os.getenv("THROTTLE_CPUS", "1.5")),
+        "THROTTLE_GRACE_SECONDS": int(os.getenv("THROTTLE_GRACE_SECONDS", "180")),
         "PROTECTED_PROCESSES": [
             p.strip().lower() for p in os.getenv(
                 "PROTECTED_PROCESSES",
@@ -79,6 +82,12 @@ def load_config() -> dict:
                             config[k] = int(v)
                         elif k == "RECOVERY_THRESHOLD":
                             config[k] = float(v)
+                        elif k == "THROTTLE_FIRST":
+                            config[k] = v.lower() in ("true", "1", "yes")
+                        elif k == "THROTTLE_CPUS":
+                            config[k] = float(v)
+                        elif k == "THROTTLE_GRACE_SECONDS":
+                            config[k] = int(v)
                         elif k == "PROTECTED_PROCESSES":
                             config[k] = [p.strip().lower() for p in v.split(",") if p.strip()]
         except Exception as e:
@@ -375,6 +384,112 @@ def terminate_offender(pid: int, name: str, timeout: int = 10) -> bool:
     return True
 
 
+def find_hot_child(root_pid: int, protected_list: list, min_cpu: float = 20.0) -> dict | None:
+    """Maior consumidor de CPU DENTRO da árvore do ofensor.
+
+    Ex.: quando o ofensor raiz é o servidor Jellyfin, o calor vem do ffmpeg filho — é ele
+    que deve ser o alvo, não o servidor inteiro (matar o container derruba o playback).
+    """
+    try:
+        descendants = psutil.Process(root_pid).children(recursive=True)
+    except Exception:
+        return None
+
+    for p in descendants:  # calibra cpu_percent
+        try:
+            p.cpu_percent()
+        except Exception:
+            pass
+    time.sleep(0.15)
+
+    best = None
+    for p in descendants:
+        try:
+            name = (p.name() or '').lower()
+            cmd = " ".join(p.cmdline() or []).lower()
+            if any(prot in name or prot in cmd for prot in protected_list):
+                continue
+            cpu_p = p.cpu_percent() or 0.0
+            if cpu_p >= min_cpu and (best is None or cpu_p > best['cpu_percent']):
+                best = {
+                    'pid': p.pid,
+                    'name': p.name(),
+                    'cpu_percent': cpu_p,
+                    'memory_percent': p.memory_percent() or 0.0,
+                    'cmdline': " ".join(p.cmdline() or [])[:80]
+                }
+        except Exception:
+            continue
+    return best
+
+
+def resolve_container_name(cid: str) -> str | None:
+    """Traduz o ID do cgroup para o nome do container Docker."""
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "--no-trunc", "--format", "{{.ID}}|{{.Names}}"],
+            capture_output=True, text=True, timeout=15
+        )
+        for line in out.stdout.splitlines():
+            full_id, _, name = line.partition("|")
+            if not full_id:
+                continue
+            if full_id.startswith(cid) or cid.startswith(full_id[:12]):
+                return name.strip() or None
+    except Exception as e:
+        logger.debug(f"Não foi possível listar containers: {e}")
+    return None
+
+
+def get_container_of_pid(pid: int) -> str | None:
+    """Nome do container Docker que contém o PID (via /proc/<pid>/cgroup), ou None."""
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    for token in cgroup.replace("/", " ").replace(":", " ").split():
+        t = token.strip()
+        if t.startswith("docker-") and t.endswith(".scope"):
+            cid = t[len("docker-"):-len(".scope")]
+        elif t.startswith("docker-"):
+            cid = t[len("docker-"):]
+        else:
+            continue
+        if len(cid) >= 12:
+            return resolve_container_name(cid)
+    return None
+
+
+def read_container_cpu_limit(name: str) -> float | None:
+    """Limite atual de CPUs do container (None = sem limite ou indisponível)."""
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", "--format", "{{.HostConfig.NanoCpus}}", name],
+            capture_output=True, text=True, timeout=15
+        )
+        nano = int((out.stdout or "0").strip() or 0)
+        return (nano / 1_000_000_000) if nano > 0 else None
+    except Exception:
+        return None
+
+
+def set_container_cpu_limit(name: str, cpus: float) -> bool:
+    """Aplica (cpus > 0) ou remove (cpus <= 0) o limite de CPU do container via `docker update`."""
+    try:
+        res = subprocess.run(
+            ["docker", "update", f"--cpus={max(cpus, 0)}", name],
+            capture_output=True, text=True, timeout=25
+        )
+        if res.returncode != 0:
+            logger.error(f"Falha ao ajustar CPU do container {name}: {(res.stderr or '').strip()}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao ajustar CPU do container {name}: {e}")
+        return False
+
+
 class ThermalAlertDaemon:
     def __init__(self):
         self.config = load_config()
@@ -388,6 +503,88 @@ class ThermalAlertDaemon:
         self.pending_kill = None       # dict: {'pid': int, 'name': str, 'cpu': float}
         self.kill_cancelled = False
         self.last_alert_time = 0
+
+        # Estado do throttle (limitar CPU antes de matar)
+        self.throttle_attempted = False
+        self.throttled_container = None   # dict: {'name': str, 'previous_cpus': float|None}
+
+    def _throttle_offender(self, temp: float) -> bool:
+        """Limita a CPU do container do ofensor (ex.: jellyfin) em vez de matar o processo.
+
+        Mantém o serviço no ar e reduz o aquecimento; a finalização continua disponível se,
+        mesmo limitado, a temperatura seguir crítica depois da tolerância extra.
+        """
+        self.throttle_attempted = True
+
+        if not self.pending_kill:
+            return False
+
+        candidates = [self.pending_kill.get('pid'), (self.pending_kill.get('child') or {}).get('pid')]
+        container = None
+        for pid in candidates:
+            if not pid:
+                continue
+            container = get_container_of_pid(pid)
+            if container:
+                break
+
+        if not container:
+            logger.info("Ofensor não pertence a um container Docker; throttle não aplicável.")
+            return False
+
+        cpus = self.config["THROTTLE_CPUS"]
+        previous = read_container_cpu_limit(container)
+        if previous is not None and previous <= cpus:
+            logger.info(f"Container {container} já está limitado a {previous} CPU(s); nada a limitar.")
+            return False
+
+        if not set_container_cpu_limit(container, cpus):
+            return False
+
+        self.throttled_container = {'name': container, 'previous_cpus': previous,
+                                    'root_pid': self.pending_kill.get('pid')}
+        logger.warning(
+            f"Throttle aplicado em vez de kill: container {container} limitado a {cpus} CPUs "
+            f"(antes: {previous if previous else 'sem limite'}) a {temp:.1f}°C."
+        )
+        self.bot.send_message(
+            f"🧊 <b>LIMITE DE CPU APLICADO (sem matar o processo)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"A temperatura seguiu crítica ({temp:.1f}°C), então o container "
+            f"<code>{container}</code> foi limitado a <b>{cpus} CPU(s)</b> "
+            f"(antes: {previous if previous else 'sem limite'}) em vez de ser finalizado.\n\n"
+            f"O serviço continua no ar, mais devagar. Se mesmo assim a temperatura não cair "
+            f"em <b>{int(self.config['THROTTLE_GRACE_SECONDS']/60)} min</b>, o processo ofensor "
+            f"será finalizado."
+        )
+        return True
+
+    def _restore_throttle(self, reason: str = "") -> None:
+        """Devolve o limite de CPU original do container (volta ao normal)."""
+        info = self.throttled_container
+        self.throttle_attempted = False
+        self.throttled_container = None
+        if not info:
+            return
+
+        prev = info['previous_cpus']
+        # `docker update --cpus=0` NÃO remove o limite (o docker ignora o zero e mantém o
+        # valor antigo). Para "sem limite", devolvemos todas as CPUs do host — na prática,
+        # equivalente a ilimitado (cpu.max = N*100000/100000).
+        cpus = prev if prev else float(os.cpu_count() or 4)
+        if set_container_cpu_limit(info['name'], cpus):
+            logger.info(
+                f"Limite de CPU do container {info['name']} restaurado para "
+                f"{prev if prev else f'{cpus:g} CPUs (sem limite)'}. {reason}".strip()
+            )
+            self.bot.send_message(
+                f"♻️ <b>LIMITE DE CPU REMOVIDO</b>\n"
+                f"O container <code>{info['name']}</code> voltou a "
+                f"{prev if prev else 'sem limite de CPU'}"
+                + (f" ({reason})." if reason else ".")
+            )
+        else:
+            logger.warning(f"Falha ao restaurar o limite de CPU do container {info['name']}.")
 
     def get_status_report(self) -> str:
         """Gera relatório de telemetria formatado em HTML para o Telegram."""
@@ -411,6 +608,14 @@ class ThermalAlertDaemon:
             lines.append(f"\n⚠️ <b>AÇÃO PROGRAMADA ATIVA:</b>")
             lines.append(f"Alvo: <code>{self.pending_kill['name']}</code> (PID: {self.pending_kill['pid']})")
             lines.append(f"Tempo restante: <b>{rem}s</b> para encerramento.")
+
+        if self.throttled_container:
+            prev = self.throttled_container.get('previous_cpus')
+            lines.append(
+                f"\n🧊 <b>Limite de CPU ativo:</b> container "
+                f"<code>{self.throttled_container['name']}</code> em "
+                f"<b>{self.config['THROTTLE_CPUS']} CPU(s)</b> (antes: {prev if prev else 'sem limite'})."
+            )
 
         # Top 3 processos
         lines.append("\n📊 <b>Top 3 Processos CPU:</b>")
@@ -455,17 +660,21 @@ class ThermalAlertDaemon:
                 pid = self.pending_kill['pid']
                 name = self.pending_kill['name']
                 logger.info(f"Encerramento automático cancelado via Telegram para PID {pid} ({name})")
+                self._restore_throttle("cancelado pelo usuário")
                 return f"🛡️ <b>Ação Cancelada!</b>\nO encerramento automático do processo <code>{name}</code> (PID {pid}) foi abortado a seu pedido."
             else:
                 return "ℹ️ Não há nenhuma finalização de processo agendada no momento."
 
         elif clean_cmd in ("/matar_agora", "/kill", "/encerrar"):
             if self.pending_kill:
-                pid = self.pending_kill['pid']
-                name = self.pending_kill['name']
-                success = terminate_offender(pid, name)
+                # Prefere o processo mais quente AGORA (ffmpeg filho) ao servidor/container inteiro.
+                target = find_hot_child(self.pending_kill['pid'], self.config["PROTECTED_PROCESSES"]) or self.pending_kill
+                pid = target['pid']
+                name = target['name']
+                success = psutil.pid_exists(pid) and terminate_offender(pid, name)
                 self.pending_kill = None
                 self.kill_cancelled = True
+                self._restore_throttle("finalização manual")
                 if success:
                     return f"🛑 <b>Processo Finalizado com Sucesso:</b>\n<code>{name}</code> (PID {pid}) e sua árvore foram encerrados imediatamente."
                 else:
@@ -577,15 +786,37 @@ class ThermalAlertDaemon:
 
                 offender_info = ""
                 if offender:
+                    # O alvo prático costuma ser um FILHO (ex.: ffmpeg dentro do container),
+                    # não o servidor inteiro: matar o servidor derrubaria o playback junto.
+                    hot_child = find_hot_child(offender['pid'], self.config["PROTECTED_PROCESSES"])
+                    offender['child'] = hot_child
                     self.pending_kill = offender
+                    self.throttle_attempted = False
                     offender_info = (
                         f"🎯 <b>Processo Ofensor Detectado:</b>\n"
                         f"• Nome: <code>{offender['name']}</code> (PID: <code>{offender['pid']}</code>)\n"
                         f"• Consumo CPU: <b>{offender['cpu_percent']:.1f}%</b> | RAM: {offender['memory_percent']:.1f}%\n"
                     )
+                    if hot_child:
+                        offender_info += (
+                            f"• Filho mais quente: <code>{hot_child['name']}</code> "
+                            f"(PID: <code>{hot_child['pid']}</code>, {hot_child['cpu_percent']:.1f}% CPU)\n"
+                        )
                 else:
                     self.pending_kill = None
                     offender_info = "• <i>Nenhum processo individual de usuário ultrapassou 10% de CPU.</i>\n"
+
+                if self.config["THROTTLE_FIRST"]:
+                    action_line = (
+                        f"Se a temperatura permanecer crítica por mais <b>{int(kill_delay/60)} minutos</b>, "
+                        f"o container do ofensor será <b>limitado em CPU</b> (o serviço continua no ar); "
+                        f"se ainda assim não resfriar, o processo ofensor será finalizado.\n\n"
+                    )
+                else:
+                    action_line = (
+                        f"Se a temperatura permanecer crítica por mais <b>{int(kill_delay/60)} minutos</b>, "
+                        f"o processo ofensor será <b>automaticamente finalizado</b> para proteger o hardware.\n\n"
+                    )
 
                 alert_msg = (
                     f"🔥 <b>ALERTA DE TEMPERATURA CRÍTICA</b> 🔥\n"
@@ -595,7 +826,7 @@ class ThermalAlertDaemon:
                     f"🌀 <b>Cooler Fan:</b> <code>{fan_rpm} RPM</code>\n\n"
                     f"{offender_info}\n"
                     f"⚠️ <b>Ação de Proteção Programada:</b>\n"
-                    f"Se a temperatura permanecer crítica por mais <b>{int(kill_delay/60)} minutos</b>, o processo ofensor será <b>automaticamente finalizado</b> para proteger o hardware.\n\n"
+                    f"{action_line}"
                     f"<i>Para cancelar ou agir agora, responda:</i>\n"
                     f"/cancelar_kill - Aborta a finalização\n"
                     f"/matar_agora - Encerra imediatamente\n"
@@ -605,22 +836,47 @@ class ThermalAlertDaemon:
                 logger.warning(f"Disparando Alerta no Telegram! Temp: {temp:.1f}°C, Duração: {int(duration)}s")
                 self.bot.send_message(alert_msg)
 
-            # Execução da ação de Kill após KILL_DELAY_SECONDS se o calor persistir
+            # Execução da ação de proteção após KILL_DELAY_SECONDS se o calor persistir
             if self.alert_sent and self.pending_kill and not self.kill_cancelled:
                 kill_elapsed = time.time() - self.kill_countdown_start
-                if kill_elapsed >= kill_delay:
-                    pid = self.pending_kill['pid']
-                    name = self.pending_kill['name']
-                    logger.warning(f"Prazo de {kill_delay}s esgotado. Finalizando processo {name} (PID: {pid}) preventivamente...")
+                if kill_elapsed >= kill_delay and self.config["THROTTLE_FIRST"] and not self.throttle_attempted:
+                    # Passo 1: em vez de matar, limita a CPU do container do ofensor e
+                    # concede uma tolerância extra para o resfriamento acontecer.
+                    if self._throttle_offender(temp):
+                        self.kill_countdown_start = time.time() + self.config["THROTTLE_GRACE_SECONDS"]
+                elif kill_elapsed >= kill_delay:
+                    # Passo 2: finaliza apenas o processo mais quente (ex.: o ffmpeg filho),
+                    # preservando o serviço/container quando existir um filho identificado.
+                    # O alvo é re-resolvido agora: entre o alerta e esta ação o processo
+                    # pesado pode ter sido trocado (ex.: próxima mídia da fila).
+                    target = find_hot_child(self.pending_kill['pid'], self.config["PROTECTED_PROCESSES"]) or self.pending_kill
+                    pid = target['pid']
+                    name = target['name']
+                    is_child = target is not self.pending_kill
+                    logger.warning(
+                        f"Prazo de {kill_delay}s esgotado. Finalizando processo {name} (PID: {pid}) preventivamente..."
+                    )
 
-                    success = terminate_offender(pid, name)
+                    target_missing = not psutil.pid_exists(pid)
+                    if target_missing:
+                        logger.warning(f"Alvo {name} (PID {pid}) não existe mais; nada a finalizar.")
+                        success = False
+                    else:
+                        success = terminate_offender(pid, name)
                     if success:
                         msg = (
                             f"🛑 <b>PROCESSO FINALIZADO PELO WATCHDOG</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━\n"
                             f"O processo <code>{name}</code> (PID: <code>{pid}</code>) foi finalizado preventivamente após {int(kill_delay/60)} minutos de temperatura crítica inalterada ({temp:.1f}°C).\n"
-                            f"O notebook está agora sob resfriamento."
                         )
+                        if is_child:
+                            msg += (
+                                f"Foi encerrado apenas o processo mais quente dentro de "
+                                f"<code>{self.pending_kill['name']}</code>, que segue em execução.\n"
+                            )
+                        msg += "O notebook está agora sob resfriamento."
+                    elif target_missing:
+                        msg = "ℹ️ O processo ofensor já não estava mais em execução ao fim do prazo (nada a finalizar)."
                     else:
                         msg = f"⚠️ Falha ao finalizar o processo <code>{name}</code> (PID: {pid}). Verifique manualmente."
 
@@ -652,6 +908,20 @@ class ThermalAlertDaemon:
             # Envia aviso de normalização se havíamos alertado antes
             if self.alert_sent and temp <= recovery_thresh:
                 logger.info(f"Temperatura normalizada com sucesso ({temp:.1f}°C <= {recovery_thresh:.0f}°C). Enviando aviso...")
+
+                # Limite de CPU aplicado antes? Só devolve o original quando o trabalho
+                # pesado já terminou — senão o aquecimento voltaria na hora.
+                if self.throttled_container:
+                    root_pid = self.throttled_container.get('root_pid') or (self.pending_kill or {}).get('pid')
+                    hot = find_hot_child(root_pid, self.config["PROTECTED_PROCESSES"], min_cpu=15.0) if root_pid else None
+                    if hot:
+                        logger.info(
+                            f"Mantendo o limite de CPU do container {self.throttled_container['name']}: "
+                            f"ainda há trabalho pesado ({hot['name']}, {hot['cpu_percent']:.1f}% CPU)."
+                        )
+                    else:
+                        self._restore_throttle("trabalho pesado concluído")
+
                 norm_msg = (
                     f"✅ <b>TEMPERATURA NORMALIZADA</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━\n"
