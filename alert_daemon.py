@@ -7,6 +7,7 @@ Integrado ao projeto sys-temp.
 
 import sys
 import os
+import re
 import time
 import signal
 import json
@@ -490,6 +491,90 @@ def set_container_cpu_limit(name: str, cpus: float) -> bool:
         return False
 
 
+# --- Throttle de processos NATIVOS: unidades systemd --user -------------------
+#
+# Processos fora de container não têm cgroup próprio que o usuário possa editar
+# (escrever cpu.max em app.slice dá Permission denied). O caminho que funciona sem
+# root é a própria unidade systemd do serviço: `systemctl --user set-property
+# <unit> CPUQuota=<N>%`, que reescreve o cpu.max da unidade em tempo real.
+
+def _parse_cpu_quota(value: str) -> float | None:
+    """Converte CPUQuotaPerSecUSec ('1.500000s', '500ms', 'infinity') em CPUs (None = sem limite)."""
+    v = (value or "").strip()
+    if not v or v.lower() in ("infinity", "[not set]"):
+        return None
+    m = re.fullmatch(r"([0-9.]+)(us|ms|s|min|h|d)?", v)
+    if not m:
+        return None
+    factor = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, "h": 3600.0, "d": 86400.0}
+    return float(m.group(1)) * factor[m.group(2) or "s"]
+
+
+def get_user_unit_of_pid(pid: int, own_unit: str = "sys-temp-alert.service") -> str | None:
+    """Unidade systemd --user que contém o PID (ex.: hermes-gateway.service), ou None.
+
+    Aceita unidades .service e .scope dentro do gerenciador do próprio usuário
+    (`user@<uid>.service/...`) — escopos de sessão (`session-N.scope`) ficam FORA desse
+    ramo e por isso nunca são alvo (limitá-los travaria a sessão inteira). A unidade do
+    próprio watchdog é ignorada (nunca limitar a si mesmo).
+    """
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    for line in cgroup.splitlines():
+        parts = [p for p in line.split(":")[-1].strip().split("/") if p]
+        if not any(p.startswith("user@") and p.endswith(".service") for p in parts):
+            continue
+        units = [
+            p for p in parts
+            if (p.endswith(".service") or p.endswith(".scope"))
+            and p != "init.scope"
+            and not p.startswith("user@")
+        ]
+        if not units:
+            continue
+        unit = units[-1]
+        if unit == own_unit:
+            return None
+        return unit
+    return None
+
+
+def read_user_unit_cpu_quota(unit: str) -> float | None:
+    """CPUQuota atual da unidade em CPUs (None = sem limite/indisponível)."""
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "CPUQuotaPerSecUSec", "--value", unit],
+            capture_output=True, text=True, timeout=20
+        )
+        if res.returncode != 0:
+            return None
+        return _parse_cpu_quota(res.stdout)
+    except Exception:
+        return None
+
+
+def set_user_unit_cpu_quota(unit: str, cpus: float) -> bool:
+    """Aplica (cpus > 0) ou remove (cpus <= 0) o limite de CPU de uma unidade systemd --user."""
+    prop = f"CPUQuota={cpus * 100:.0f}%" if cpus > 0 else "CPUQuota="
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "set-property", unit, prop],
+            capture_output=True, text=True, timeout=25
+        )
+        if res.returncode != 0:
+            logger.error(
+                f"Falha ao ajustar CPU da unidade {unit}: {(res.stderr or '').strip()}"
+            )
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao ajustar CPU da unidade {unit}: {e}")
+        return False
+
+
 class ThermalAlertDaemon:
     def __init__(self):
         self.config = load_config()
@@ -506,53 +591,75 @@ class ThermalAlertDaemon:
 
         # Estado do throttle (limitar CPU antes de matar)
         self.throttle_attempted = False
-        self.throttled_container = None   # dict: {'name': str, 'previous_cpus': float|None}
+        self.throttled_target = None   # dict: {'kind','name','previous_cpus','root_pid'}
 
     def _throttle_offender(self, temp: float) -> bool:
-        """Limita a CPU do container do ofensor (ex.: jellyfin) em vez de matar o processo.
+        """Limita a CPU do ofensor em vez de matá-lo.
 
-        Mantém o serviço no ar e reduz o aquecimento; a finalização continua disponível se,
-        mesmo limitado, a temperatura seguir crítica depois da tolerância extra.
+        Dois caminhos, na ordem:
+          1. processo dentro de container Docker → `docker update --cpus=N` no container;
+          2. processo nativo em unidade systemd --user → `systemctl --user set-property
+             <unit> CPUQuota=N%`.
+        Sem nenhum dos dois, retorna False e o watchdog segue para a finalização.
         """
         self.throttle_attempted = True
 
         if not self.pending_kill:
             return False
 
-        candidates = [self.pending_kill.get('pid'), (self.pending_kill.get('child') or {}).get('pid')]
-        container = None
-        for pid in candidates:
-            if not pid:
-                continue
-            container = get_container_of_pid(pid)
-            if container:
-                break
-
-        if not container:
-            logger.info("Ofensor não pertence a um container Docker; throttle não aplicável.")
-            return False
-
         cpus = self.config["THROTTLE_CPUS"]
-        previous = read_container_cpu_limit(container)
-        if previous is not None and previous <= cpus:
-            logger.info(f"Container {container} já está limitado a {previous} CPU(s); nada a limitar.")
-            return False
+        pids = [self.pending_kill.get('pid'), (self.pending_kill.get('child') or {}).get('pid')]
 
-        if not set_container_cpu_limit(container, cpus):
-            return False
+        # Caminho 1: container Docker
+        container = None
+        for pid in pids:
+            if pid:
+                container = get_container_of_pid(pid)
+                if container:
+                    break
+        if container:
+            previous = read_container_cpu_limit(container)
+            if previous is not None and previous <= cpus:
+                logger.info(f"Container {container} já está limitado a {previous} CPU(s); nada a limitar.")
+                return False
+            if not set_container_cpu_limit(container, cpus):
+                return False
+            self.throttled_target = {'kind': 'container', 'name': container,
+                                     'previous_cpus': previous,
+                                     'root_pid': self.pending_kill.get('pid')}
+            alvo = f"container <code>{container}</code>"
+        else:
+            # Caminho 2: unidade systemd --user
+            unit = None
+            for pid in pids:
+                if pid:
+                    unit = get_user_unit_of_pid(pid)
+                    if unit:
+                        break
+            if not unit:
+                logger.info("Ofensor não está em container Docker nem em unidade systemd --user; throttle não aplicável.")
+                return False
+            previous = read_user_unit_cpu_quota(unit)
+            if previous is not None and previous <= cpus:
+                logger.info(f"Unidade {unit} já está limitada a {previous} CPU(s); nada a limitar.")
+                return False
+            if not set_user_unit_cpu_quota(unit, cpus):
+                return False
+            self.throttled_target = {'kind': 'unit', 'name': unit,
+                                     'previous_cpus': previous,
+                                     'root_pid': self.pending_kill.get('pid')}
+            alvo = f"serviço de usuário <code>{unit}</code>"
 
-        self.throttled_container = {'name': container, 'previous_cpus': previous,
-                                    'root_pid': self.pending_kill.get('pid')}
         logger.warning(
-            f"Throttle aplicado em vez de kill: container {container} limitado a {cpus} CPUs "
-            f"(antes: {previous if previous else 'sem limite'}) a {temp:.1f}°C."
+            f"Throttle aplicado em vez de kill: {alvo} limitado a {cpus} CPU(s) "
+            f"(antes: {'sem limite' if previous is None else f'{previous:g}'}) a {temp:.1f}°C."
         )
         self.bot.send_message(
             f"🧊 <b>LIMITE DE CPU APLICADO (sem matar o processo)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"A temperatura seguiu crítica ({temp:.1f}°C), então o container "
-            f"<code>{container}</code> foi limitado a <b>{cpus} CPU(s)</b> "
-            f"(antes: {previous if previous else 'sem limite'}) em vez de ser finalizado.\n\n"
+            f"A temperatura seguiu crítica ({temp:.1f}°C), então o {alvo} foi limitado a "
+            f"<b>{cpus:g} CPU(s)</b> "
+            f"(antes: {'sem limite' if previous is None else f'{previous:g}'}) em vez de ser finalizado.\n\n"
             f"O serviço continua no ar, mais devagar. Se mesmo assim a temperatura não cair "
             f"em <b>{int(self.config['THROTTLE_GRACE_SECONDS']/60)} min</b>, o processo ofensor "
             f"será finalizado."
@@ -560,31 +667,38 @@ class ThermalAlertDaemon:
         return True
 
     def _restore_throttle(self, reason: str = "") -> None:
-        """Devolve o limite de CPU original do container (volta ao normal)."""
-        info = self.throttled_container
+        """Devolve o limite de CPU original do alvo (container ou unidade systemd)."""
+        info = self.throttled_target
         self.throttle_attempted = False
-        self.throttled_container = None
+        self.throttled_target = None
         if not info:
             return
 
-        prev = info['previous_cpus']
-        # `docker update --cpus=0` NÃO remove o limite (o docker ignora o zero e mantém o
-        # valor antigo). Para "sem limite", devolvemos todas as CPUs do host — na prática,
-        # equivalente a ilimitado (cpu.max = N*100000/100000).
-        cpus = prev if prev else float(os.cpu_count() or 4)
-        if set_container_cpu_limit(info['name'], cpus):
+        prev = info.get('previous_cpus')
+        is_container = info.get('kind') == 'container'
+        if is_container:
+            # `docker update --cpus=0` NÃO remove o limite (o docker ignora o zero); para
+            # "sem limite" devolvemos todas as CPUs do host, equivalente na prática.
+            cpus = prev if prev else float(os.cpu_count() or 4)
+            ok = set_container_cpu_limit(info['name'], cpus)
+        else:
+            # `CPUQuota=` vazio devolve a unidade para "infinity" (sem limite).
+            ok = set_user_unit_cpu_quota(info['name'], prev or 0)
+
+        alvo = f"container {info['name']}" if is_container else f"unidade {info['name']}"
+        artigo = ("O", "do") if is_container else ("A", "da")
+        if ok:
             logger.info(
-                f"Limite de CPU do container {info['name']} restaurado para "
-                f"{prev if prev else f'{cpus:g} CPUs (sem limite)'}. {reason}".strip()
+                f"Limite de CPU {artigo[1]} {alvo} restaurado para "
+                f"{prev if prev else 'sem limite'}. {reason}".strip()
             )
             self.bot.send_message(
                 f"♻️ <b>LIMITE DE CPU REMOVIDO</b>\n"
-                f"O container <code>{info['name']}</code> voltou a "
-                f"{prev if prev else 'sem limite de CPU'}"
+                f"{artigo[0]} {alvo} voltou a {prev if prev else 'sem limite de CPU'}"
                 + (f" ({reason})." if reason else ".")
             )
         else:
-            logger.warning(f"Falha ao restaurar o limite de CPU do container {info['name']}.")
+            logger.warning(f"Falha ao restaurar o limite de CPU {artigo[1]} {alvo}.")
 
     def get_status_report(self) -> str:
         """Gera relatório de telemetria formatado em HTML para o Telegram."""
@@ -609,12 +723,13 @@ class ThermalAlertDaemon:
             lines.append(f"Alvo: <code>{self.pending_kill['name']}</code> (PID: {self.pending_kill['pid']})")
             lines.append(f"Tempo restante: <b>{rem}s</b> para encerramento.")
 
-        if self.throttled_container:
-            prev = self.throttled_container.get('previous_cpus')
+        if self.throttled_target:
+            prev = self.throttled_target.get('previous_cpus')
+            tipo = "container" if self.throttled_target.get('kind') == 'container' else "serviço"
             lines.append(
-                f"\n🧊 <b>Limite de CPU ativo:</b> container "
-                f"<code>{self.throttled_container['name']}</code> em "
-                f"<b>{self.config['THROTTLE_CPUS']} CPU(s)</b> (antes: {prev if prev else 'sem limite'})."
+                f"\n🧊 <b>Limite de CPU ativo:</b> {tipo} "
+                f"<code>{self.throttled_target['name']}</code> em "
+                f"<b>{self.config['THROTTLE_CPUS']:g} CPU(s)</b> (antes: {prev if prev else 'sem limite'})."
             )
 
         # Top 3 processos
@@ -911,12 +1026,12 @@ class ThermalAlertDaemon:
 
                 # Limite de CPU aplicado antes? Só devolve o original quando o trabalho
                 # pesado já terminou — senão o aquecimento voltaria na hora.
-                if self.throttled_container:
-                    root_pid = self.throttled_container.get('root_pid') or (self.pending_kill or {}).get('pid')
+                if self.throttled_target:
+                    root_pid = self.throttled_target.get('root_pid') or (self.pending_kill or {}).get('pid')
                     hot = find_hot_child(root_pid, self.config["PROTECTED_PROCESSES"], min_cpu=15.0) if root_pid else None
                     if hot:
                         logger.info(
-                            f"Mantendo o limite de CPU do container {self.throttled_container['name']}: "
+                            f"Mantendo o limite de CPU de {self.throttled_target['name']}: "
                             f"ainda há trabalho pesado ({hot['name']}, {hot['cpu_percent']:.1f}% CPU)."
                         )
                     else:
